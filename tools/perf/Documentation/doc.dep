@@ -1,0 +1,8 @@
+perf-annotate.html perf-annotate.xml : itrace.txt
+perf-top.html perf-top.xml : callchain-overhead-calculation.txt
+perf-stat.html perf-stat.xml : intel-hybrid.txt
+perf-intel-pt.html perf-intel-pt.xml : build-xed.txt
+perf-record.html perf-record.xml : intel-hybrid.txt
+perf-inject.html perf-inject.xml : itrace.txt
+perf-report.html perf-report.xml : callchain-overhead-calculation.txt itrace.txt
+perf-script.html perf-script.xml : itrace.txt

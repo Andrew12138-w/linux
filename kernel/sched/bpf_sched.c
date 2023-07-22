@@ -5,17 +5,20 @@
 #include <linux/bpf_sched.h>
 #include <linux/btf_ids.h>
 #include "sched.h"
+#include "/usr/src/linux/block/blk-throttle.h"
 
 DEFINE_STATIC_KEY_FALSE(bpf_sched_enabled_key);
 
 /*
  * For every hook declare a nop function where a BPF program can be attached.
  */
-#define BPF_SCHED_HOOK(RET, DEFAULT, NAME, ...)	\
-noinline RET bpf_sched_##NAME(__VA_ARGS__)	\
-{						\
-	return DEFAULT;				\
-}
+#define CPU_SCHED
+#define IO_SCHED
+#define BPF_SCHED_HOOK(RET, DEFAULT, NAME, ...)                                \
+	noinline RET bpf_sched_##NAME(__VA_ARGS__)                             \
+	{                                                                      \
+		return DEFAULT;                                                \
+	}
 
 #include <linux/sched_hook_defs.h>
 #undef BPF_SCHED_HOOK
@@ -25,6 +28,9 @@ BTF_SET_START(bpf_sched_hooks)
 #include <linux/sched_hook_defs.h>
 #undef BPF_SCHED_HOOK
 BTF_SET_END(bpf_sched_hooks)
+
+#undef CPU_SCHED
+#undef IO_SCHED
 
 int bpf_sched_verify_prog(struct bpf_verifier_log *vlog,
 			  const struct bpf_prog *prog)
@@ -49,9 +55,9 @@ BPF_CALL_1(bpf_sched_entity_to_tgidpid, struct sched_entity *, se)
 	if (entity_is_task(se)) {
 		struct task_struct *task = task_of(se);
 
-		return (u64) task->tgid << 32 | task->pid;
+		return (u64)task->tgid << 32 | task->pid;
 	} else {
-		return (u64) -1;
+		return (u64)-1;
 	}
 }
 
@@ -61,11 +67,11 @@ BPF_CALL_1(bpf_sched_entity_to_cgrpid, struct sched_entity *, se)
 	if (!entity_is_task(se))
 		return cgroup_id(se->cfs_rq->tg->css.cgroup);
 #endif
-	return (u64) -1;
+	return (u64)-1;
 }
 
-BPF_CALL_2(bpf_sched_entity_belongs_to_cgrp, struct sched_entity *, se,
-	   u64, cgrpid)
+BPF_CALL_2(bpf_sched_entity_belongs_to_cgrp, struct sched_entity *, se, u64,
+	   cgrpid)
 {
 #ifdef CONFIG_CGROUPS
 	struct cgroup *cgrp;
@@ -88,28 +94,28 @@ BPF_CALL_2(bpf_sched_entity_belongs_to_cgrp, struct sched_entity *, se,
 BTF_ID_LIST_SINGLE(btf_sched_entity_ids, struct, sched_entity)
 
 static const struct bpf_func_proto bpf_sched_entity_to_tgidpid_proto = {
-	.func		= bpf_sched_entity_to_tgidpid,
-	.gpl_only	= false,
-	.ret_type	= RET_INTEGER,
-	.arg1_type	= ARG_PTR_TO_BTF_ID,
-	.arg1_btf_id	= &btf_sched_entity_ids[0],
+	.func = bpf_sched_entity_to_tgidpid,
+	.gpl_only = false,
+	.ret_type = RET_INTEGER,
+	.arg1_type = ARG_PTR_TO_BTF_ID,
+	.arg1_btf_id = &btf_sched_entity_ids[0],
 };
 
 static const struct bpf_func_proto bpf_sched_entity_to_cgrpid_proto = {
-	.func		= bpf_sched_entity_to_cgrpid,
-	.gpl_only	= false,
-	.ret_type	= RET_INTEGER,
-	.arg1_type	= ARG_PTR_TO_BTF_ID,
-	.arg1_btf_id	= &btf_sched_entity_ids[0],
+	.func = bpf_sched_entity_to_cgrpid,
+	.gpl_only = false,
+	.ret_type = RET_INTEGER,
+	.arg1_type = ARG_PTR_TO_BTF_ID,
+	.arg1_btf_id = &btf_sched_entity_ids[0],
 };
 
 static const struct bpf_func_proto bpf_sched_entity_belongs_to_cgrp_proto = {
-	.func		= bpf_sched_entity_belongs_to_cgrp,
-	.gpl_only	= false,
-	.ret_type	= RET_INTEGER,
-	.arg1_type	= ARG_PTR_TO_BTF_ID,
-	.arg1_btf_id	= &btf_sched_entity_ids[0],
-	.arg2_type	= ARG_ANYTHING,
+	.func = bpf_sched_entity_belongs_to_cgrp,
+	.gpl_only = false,
+	.ret_type = RET_INTEGER,
+	.arg1_type = ARG_PTR_TO_BTF_ID,
+	.arg1_btf_id = &btf_sched_entity_ids[0],
+	.arg2_type = ARG_ANYTHING,
 };
 
 static const struct bpf_func_proto *
@@ -129,8 +135,7 @@ bpf_sched_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 	}
 }
 
-const struct bpf_prog_ops bpf_sched_prog_ops = {
-};
+const struct bpf_prog_ops bpf_sched_prog_ops = {};
 
 const struct bpf_verifier_ops bpf_sched_verifier_ops = {
 	.get_func_proto = bpf_sched_func_proto,

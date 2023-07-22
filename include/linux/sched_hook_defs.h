@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+#ifdef CPU_SCHED
 BPF_SCHED_HOOK(int, 0, cfs_check_preempt_tick, struct sched_entity *curr,
 	       unsigned long delta_exec)
 BPF_SCHED_HOOK(int, 0, cfs_check_update_curr, struct sched_entity *curr,
@@ -9,3 +10,8 @@ BPF_SCHED_HOOK(int, 0, cfs_wakeup_preempt_entity, struct sched_entity *curr,
 	       struct sched_entity *se)
 BPF_SCHED_HOOK(int, 0, cfs_block_sleep, struct sched_entity *curr,
 	       struct sched_entity *se)
+#endif
+#ifdef IO_SCHED
+BPF_SCHED_HOOK(int, 0, blk_check_throttle, struct throtl_grp *tg, struct bio *bio
+	       )
+#endif

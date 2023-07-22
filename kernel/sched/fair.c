@@ -21,7 +21,9 @@
  *  Copyright (C) 2007 Red Hat, Inc., Peter Zijlstra
  */
 #include "sched.h"
+#define CPU_SCHED
 #include <linux/bpf_sched.h>
+#undef CPU_SCHED
 
 /*
  * Targeted preemption latency for CPU-bound tasks:

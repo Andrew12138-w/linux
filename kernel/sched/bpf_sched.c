@@ -124,6 +124,10 @@ bpf_sched_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 	switch (func_id) {
 	case BPF_FUNC_trace_printk:
 		return bpf_get_trace_printk_proto();
+	case BPF_FUNC_ktime_get_ns:
+		return &bpf_ktime_get_ns_proto;
+	case BPF_FUNC_get_current_pid_tgid:
+		return &bpf_get_current_pid_tgid_proto;
 	case BPF_FUNC_sched_entity_to_tgidpid:
 		return &bpf_sched_entity_to_tgidpid_proto;
 	case BPF_FUNC_sched_entity_to_cgrpid:

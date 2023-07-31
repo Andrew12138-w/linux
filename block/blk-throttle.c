@@ -5,32 +5,8 @@
  * Copyright (C) 2010 Vivek Goyal <vgoyal@redhat.com>
  */
 
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/blkdev.h>
-#include <linux/bio.h>
-#include <linux/blktrace_api.h>
-#include <linux/blk-cgroup.h>
-#include "blk.h"
-#include "blk-cgroup-rwstat.h"
+#include "blk-throttle.h"
 
-/* Max dispatch from a group in 1 round */
-#define THROTL_GRP_QUANTUM 8
-
-/* Total max dispatch from all groups in one round */
-#define THROTL_QUANTUM 32
-
-/* Throttling is performed over a slice and after that slice is renewed */
-#define DFL_THROTL_SLICE_HD (HZ / 10)
-#define DFL_THROTL_SLICE_SSD (HZ / 50)
-#define MAX_THROTL_SLICE (HZ)
-#define MAX_IDLE_TIME (5L * 1000 * 1000) /* 5 s */
-#define MIN_THROTL_BPS (320 * 1024)
-#define MIN_THROTL_IOPS (10)
-#define DFL_LATENCY_TARGET (-1L)
-#define DFL_IDLE_THRESHOLD (0)
-#define DFL_HD_BASELINE_LATENCY (4000L) /* 4ms */
-#define LATENCY_FILTERED_SSD (0)
 /*
  * For HD, very small latency comes from sequential IO. Such IO is helpless to
  * help determine if its IO is impacted by others, hence we ignore the IO
@@ -41,196 +17,6 @@ static struct blkcg_policy blkcg_policy_throtl;
 
 /* A workqueue to queue throttle related work */
 static struct workqueue_struct *kthrotld_workqueue;
-
-/*
- * To implement hierarchical throttling, throtl_grps form a tree and bios
- * are dispatched upwards level by level until they reach the top and get
- * issued.  When dispatching bios from the children and local group at each
- * level, if the bios are dispatched into a single bio_list, there's a risk
- * of a local or child group which can queue many bios at once filling up
- * the list starving others.
- *
- * To avoid such starvation, dispatched bios are queued separately
- * according to where they came from.  When they are again dispatched to
- * the parent, they're popped in round-robin order so that no single source
- * hogs the dispatch window.
- *
- * throtl_qnode is used to keep the queued bios separated by their sources.
- * Bios are queued to throtl_qnode which in turn is queued to
- * throtl_service_queue and then dispatched in round-robin order.
- *
- * It's also used to track the reference counts on blkg's.  A qnode always
- * belongs to a throtl_grp and gets queued on itself or the parent, so
- * incrementing the reference of the associated throtl_grp when a qnode is
- * queued and decrementing when dequeued is enough to keep the whole blkg
- * tree pinned while bios are in flight.
- */
-struct throtl_qnode {
-	struct list_head node; /* service_queue->queued[] */
-	struct bio_list bios; /* queued bios */
-	struct throtl_grp *tg; /* tg this qnode belongs to */
-};
-
-struct throtl_service_queue {
-	struct throtl_service_queue *parent_sq; /* the parent service_queue */
-
-	/*
-	 * Bios queued directly to this service_queue or dispatched from
-	 * children throtl_grp's.
-	 */
-	struct list_head queued[2]; /* throtl_qnode [READ/WRITE] */
-	unsigned int nr_queued[2]; /* number of queued bios */
-
-	/*
-	 * RB tree of active children throtl_grp's, which are sorted by
-	 * their ->disptime.
-	 */
-	struct rb_root_cached pending_tree; /* RB tree of active tgs */
-	unsigned int nr_pending; /* # queued in the tree */
-	unsigned long first_pending_disptime; /* disptime of the first tg */
-	struct timer_list pending_timer; /* fires on first_pending_disptime */
-};
-
-enum tg_state_flags {
-	THROTL_TG_PENDING = 1 << 0, /* on parent's pending tree */
-	THROTL_TG_WAS_EMPTY = 1 << 1, /* bio_lists[] became non-empty */
-};
-
-#define rb_entry_tg(node) rb_entry((node), struct throtl_grp, rb_node)
-
-enum {
-	LIMIT_LOW,
-	LIMIT_MAX,
-	LIMIT_CNT,
-};
-
-struct throtl_grp {
-	/* must be the first member */
-	struct blkg_policy_data pd;
-
-	/* active throtl group service_queue member */
-	struct rb_node rb_node;
-
-	/* throtl_data this group belongs to */
-	struct throtl_data *td;
-
-	/* this group's service queue */
-	struct throtl_service_queue service_queue;
-
-	/*
-	 * qnode_on_self is used when bios are directly queued to this
-	 * throtl_grp so that local bios compete fairly with bios
-	 * dispatched from children.  qnode_on_parent is used when bios are
-	 * dispatched from this throtl_grp into its parent and will compete
-	 * with the sibling qnode_on_parents and the parent's
-	 * qnode_on_self.
-	 */
-	struct throtl_qnode qnode_on_self[2];
-	struct throtl_qnode qnode_on_parent[2];
-
-	/*
-	 * Dispatch time in jiffies. This is the estimated time when group
-	 * will unthrottle and is ready to dispatch more bio. It is used as
-	 * key to sort active groups in service tree.
-	 */
-	unsigned long disptime;
-
-	unsigned int flags;
-
-	/* are there any throtl rules between this group and td? */
-	bool has_rules[2];
-
-	/* internally used bytes per second rate limits */
-	uint64_t bps[2][LIMIT_CNT];
-	/* user configured bps limits */
-	uint64_t bps_conf[2][LIMIT_CNT];
-
-	/* internally used IOPS limits */
-	unsigned int iops[2][LIMIT_CNT];
-	/* user configured IOPS limits */
-	unsigned int iops_conf[2][LIMIT_CNT];
-
-	/* Number of bytes dispatched in current slice */
-	uint64_t bytes_disp[2];
-	/* Number of bio's dispatched in current slice */
-	unsigned int io_disp[2];
-
-	unsigned long last_low_overflow_time[2];
-
-	uint64_t last_bytes_disp[2];
-	unsigned int last_io_disp[2];
-
-	unsigned long last_check_time;
-
-	unsigned long latency_target; /* us */
-	unsigned long latency_target_conf; /* us */
-	/* When did we start a new slice */
-	unsigned long slice_start[2];
-	unsigned long slice_end[2];
-
-	unsigned long last_finish_time; /* ns / 1024 */
-	unsigned long checked_last_finish_time; /* ns / 1024 */
-	unsigned long avg_idletime; /* ns / 1024 */
-	unsigned long idletime_threshold; /* us */
-	unsigned long idletime_threshold_conf; /* us */
-
-	unsigned int bio_cnt; /* total bios */
-	unsigned int bad_bio_cnt; /* bios exceeding latency threshold */
-	unsigned long bio_cnt_reset_time;
-
-	atomic_t io_split_cnt[2];
-	atomic_t last_io_split_cnt[2];
-
-	struct blkg_rwstat stat_bytes;
-	struct blkg_rwstat stat_ios;
-};
-
-#define IO_SCHED
-#include <linux/bpf_sched.h>
-#undef IO_SCHED
-
-/* We measure latency for request size from <= 4k to >= 1M */
-#define LATENCY_BUCKET_SIZE 9
-
-struct latency_bucket {
-	unsigned long total_latency; /* ns / 1024 */
-	int samples;
-};
-
-struct avg_latency_bucket {
-	unsigned long latency; /* ns / 1024 */
-	bool valid;
-};
-
-struct throtl_data {
-	/* service tree for active throtl groups */
-	struct throtl_service_queue service_queue;
-
-	struct request_queue *queue;
-
-	/* Total Number of queued bios on READ and WRITE lists */
-	unsigned int nr_queued[2];
-
-	unsigned int throtl_slice;
-
-	/* Work for dispatching throttled bios */
-	struct work_struct dispatch_work;
-	unsigned int limit_index;
-	bool limit_valid[LIMIT_CNT];
-
-	unsigned long low_upgrade_time;
-	unsigned long low_downgrade_time;
-
-	unsigned int scale;
-
-	struct latency_bucket tmp_buckets[2][LATENCY_BUCKET_SIZE];
-	struct avg_latency_bucket avg_buckets[2][LATENCY_BUCKET_SIZE];
-	struct latency_bucket __percpu *latency_buckets[2];
-	unsigned long last_calculate_time;
-	unsigned long filtered_latency;
-
-	bool track_bio_latency;
-};
 
 static void throtl_pending_timer_fn(struct timer_list *t);
 
@@ -467,6 +253,7 @@ static struct bio *throtl_pop_queued(struct list_head *queued,
 	if (list_empty(queued))
 		return NULL;
 
+	/* 访问头节点后的第一个节点的外层qnode */
 	qn = list_first_entry(queued, struct throtl_qnode, node);
 	bio = bio_list_pop(&qn->bios);
 	WARN_ON_ONCE(!bio);
@@ -1023,13 +810,6 @@ static bool tg_may_dispatch(struct throtl_grp *tg, struct bio *bio,
 	BUG_ON(tg->service_queue.nr_queued[rw] &&
 	       bio != throtl_peek_queued(&tg->service_queue.queued[rw]));
 
-	/* eBPF */
-	if (bpf_sched_enabled()) {
-		if (bpf_sched_blk_check_throttle(tg, bio)) {
-			return false;
-		}
-	}
-
 	/* If tg->bps = -1, then BW is unlimited */
 	if (bps_limit == U64_MAX && iops_limit == UINT_MAX) {
 		if (wait)
@@ -1127,6 +907,21 @@ static void throtl_add_bio_tg(struct bio *bio, struct throtl_qnode *qn,
 	sq->nr_queued[rw]++;
 	throtl_enqueue_tg(tg);
 }
+
+// static void wyz_throtl_add_bio_tg(struct bio *bio, struct throtl_qnode *qn,
+// 				  struct throtl_grp *tg)
+// {
+// 	bool rw = bio_data_dir(bio);
+
+// 	printk("enter wyz_throtl_add_bio_tg");
+// 	// throtl_qnode_add_bio(bio, qn, &sq->queued[rw]);
+// 	bio_list_add(&qn->bios, bio);
+// 	if (list_empty(&qn->node)) {
+// 		printk("qn->node empty");
+// 		list_add_tail(&qn->node, &tg->wyz_queued[rw]);
+// 		// blkg_get(tg_to_blkg(qn->tg));
+// 	}
+// }
 
 static void tg_update_disptime(struct throtl_grp *tg)
 {
@@ -1381,6 +1176,49 @@ static void blk_throtl_dispatch_work_fn(struct work_struct *work)
 		blk_finish_plug(&plug);
 	}
 }
+
+// static void wyz_blk_throtl_dispatch_work_fn(struct work_struct *work)
+// {
+// 	/* 这个地方td没改，可以改成tg里面自己的一个work_struct */
+// 	// struct throtl_data *td =
+// 	// 	container_of(work, struct throtl_data, dispatch_work);
+// 	/* 感觉还是得改，貌似td是从request_queue里kmalloc出来的 */
+
+// 	struct throtl_grp *tg =
+// 		container_of(work, struct throtl_grp, wyz_dispatch_work);
+// 	// struct throtl_service_queue *td_sq = &tg->test;
+// 	// struct request_queue *q = td->queue;
+// 	struct bio_list bio_list_on_stack;
+// 	struct bio *bio;
+// 	struct blk_plug plug;
+// 	int rw;
+
+// 	printk("enter wyz_blk_throtl_dispatch_work_fn!");
+
+// 	bio_list_init(&bio_list_on_stack);
+
+// 	// spin_lock_irq(&q->queue_lock);
+// 	// for (rw = READ; rw <= WRITE; rw++)
+// 	// 	while ((bio = throtl_pop_queued(&td_sq->queued[rw], NULL)))
+// 	// 		bio_list_add(&bio_list_on_stack, bio);
+// 	// spin_unlock_irq(&q->queue_lock);
+
+// 	// spin_lock_irq(&q->queue_lock);
+// 	for (rw = READ; rw <= WRITE; rw++)
+// 		while ((bio = throtl_pop_queued(&tg->wyz_queued[rw], NULL)))
+// 			bio_list_add(&bio_list_on_stack, bio);
+// 	// spin_unlock_irq(&q->queue_lock);
+
+// 	printk("read wyz_queued wyz_blk_throtl_dispatch_work_fn!");
+
+// 	if (!bio_list_empty(&bio_list_on_stack)) {
+// 		blk_start_plug(&plug);
+// 		while ((bio = bio_list_pop(&bio_list_on_stack)))
+// 			submit_bio_noacct(bio);
+// 		blk_finish_plug(&plug);
+// 	}
+// 	printk("finish wyz_blk_throtl_dispatch_work_fn!");
+// }
 
 static u64 tg_prfill_conf_u64(struct seq_file *sf, struct blkg_policy_data *pd,
 			      int off)
@@ -2237,6 +2075,7 @@ bool blk_throtl_bio(struct bio *bio)
 	bool throttled = false;
 	struct throtl_data *td = tg->td;
 
+	// printk("enter blk_throtl_bio");
 	rcu_read_lock();
 
 	/* see throtl_charge_bio() */
@@ -2249,9 +2088,49 @@ bool blk_throtl_bio(struct bio *bio)
 		blkg_rwstat_add(&tg->stat_ios, bio->bi_opf, 1);
 	}
 
+	// printk("before bpf enabled");
+	if (bpf_sched_enabled()) {
+		int ret;
+		printk("after bpf enabled and func");
+		ret = bpf_sched_blk_check_throttle(bio, tg);
+		if (ret == 1)
+			goto jmprules;
+		if (ret == 2)
+			goto out;
+		if (ret == 3) {
+			/* throttle */
+			// 有必要锁？
+			// spin_lock_irq(&q->queue_lock);
+
+			/* 本来的数据结构 */
+			// tg->last_low_overflow_time[rw] = jiffies;
+			// td->nr_queued[rw]++;
+			// throtl_add_bio_tg(bio, qn, tg);
+
+			/* 单个bio_list一直添加 */
+			// bio_list_add(&tg->test_throtl_bio_list[rw], bio);
+
+			/* 多个bio_list(qnode链表)+自己的数据结构 */
+			// wyz_throtl_add_bio_tg(bio, &tg->wyz_qnode_on_self[rw],tg);
+			throttled = true;
+			// spin_unlock_irq(&q->queue_lock);
+			goto out;
+		}
+		if (ret == 4) {
+			// INIT_WORK(&tg->wyz_dispatch_work,
+			// 	  wyz_blk_throtl_dispatch_work_fn);
+			// INIT_LIST_HEAD(&tg->wyz_queued[0]);
+			// INIT_LIST_HEAD(&tg->wyz_queued[1]);
+		}
+		if (ret == 5) {
+			/* dispatch worker */
+			// queue_work(kthrotld_workqueue, &tg->wyz_dispatch_work);
+		}
+	}
 	if (!tg->has_rules[rw])
 		goto out;
 
+jmprules:
 	spin_lock_irq(&q->queue_lock);
 
 	throtl_update_latency_buckets(td);
@@ -2267,6 +2146,7 @@ again:
 		throtl_downgrade_check(tg);
 		throtl_upgrade_check(tg);
 		/* throtl is FIFO - if bios are already queued, should queue */
+		/* 已经在限流了，新的肯定要等 */
 		if (sq->nr_queued[rw])
 			break;
 
@@ -2300,6 +2180,7 @@ again:
 		 * @bio passed through this layer without being throttled.
 		 * Climb up the ladder.  If we're already at the top, it
 		 * can be executed directly.
+		 * while循环的意义是一层层向上找
 		 */
 		qn = &tg->qnode_on_parent[rw];
 		sq = sq->parent_sq;
@@ -2309,6 +2190,7 @@ again:
 	}
 
 	/* out-of-limit, queue to @tg */
+	/* 这个bio要限流时，代码如下 */
 	throtl_log(
 		sq,
 		"[%c] bio. bdisp=%llu sz=%u bps=%llu iodisp=%u iops=%u queued=%d/%d",
@@ -2549,7 +2431,7 @@ static int __init throtl_init(void)
 	kthrotld_workqueue = alloc_workqueue("kthrotld", WQ_MEM_RECLAIM, 0);
 	if (!kthrotld_workqueue)
 		panic("Failed to create kthrotld\n");
-
+	printk("workqueue init success");
 	return blkcg_policy_register(&blkcg_policy_throtl);
 }
 

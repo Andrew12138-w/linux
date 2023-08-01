@@ -194,6 +194,7 @@ static void throtl_qnode_init(struct throtl_qnode *qn, struct throtl_grp *tg)
 
 /**
  * throtl_qnode_add_bio - add a bio to a throtl_qnode and activate it
+ * 把bio加到qnode里，如果这个qnode还没在本tg的service queue里，挂上去
  * @bio: bio being added
  * @qn: qnode to add bio to
  * @queued: the service_queue->queued[] list @qn belongs to
@@ -238,6 +239,8 @@ static struct bio *throtl_peek_queued(struct list_head *queued)
  * Pop the first bio from the qnode list @queued.  After popping, the first
  * qnode is removed from @queued if empty or moved to the end of @queued so
  * that the popping order is round-robin.
+ * 取走queue里的第一个qnode中的一个bio，
+ * 如果qnode里没有其他bio了就del qnode，如果还有的话就把这个qnode放到queue的末尾，满足RR。
  *
  * When the first qnode is removed, its associated throtl_grp should be put
  * too.  If @tg_to_put is NULL, this function automatically puts it;
@@ -903,7 +906,7 @@ static void throtl_add_bio_tg(struct bio *bio, struct throtl_qnode *qn,
 		tg->flags |= THROTL_TG_WAS_EMPTY;
 
 	throtl_qnode_add_bio(bio, qn, &sq->queued[rw]);
-
+	printk("cgroup: add bio to qnode");
 	sq->nr_queued[rw]++;
 	throtl_enqueue_tg(tg);
 }
@@ -913,12 +916,14 @@ static void throtl_add_bio_tg(struct bio *bio, struct throtl_qnode *qn,
 // {
 // 	bool rw = bio_data_dir(bio);
 
-// 	printk("enter wyz_throtl_add_bio_tg");
+// 	printk("ebpf enter wyz_throtl_add_bio_tg");
 // 	// throtl_qnode_add_bio(bio, qn, &sq->queued[rw]);
 // 	bio_list_add(&qn->bios, bio);
+// 	printk("ebpf bio_list_add wyz_throtl_add_bio_tg");
 // 	if (list_empty(&qn->node)) {
-// 		printk("qn->node empty");
+// 		/* 如果添加bio到的qnode没被挂在queued上,实验时只会被挂一次应该 */
 // 		list_add_tail(&qn->node, &tg->wyz_queued[rw]);
+// 		printk("ebpf solo qnode, attach to queued");
 // 		// blkg_get(tg_to_blkg(qn->tg));
 // 	}
 // }
@@ -987,10 +992,12 @@ static void tg_dispatch_one_bio(struct throtl_grp *tg, bool rw)
 	 */
 	if (parent_tg) {
 		throtl_add_bio_tg(bio, &tg->qnode_on_parent[rw], parent_tg);
+		printk("cgroup: move bio to qnode_on_parent ");
 		start_parent_slice_with_credit(tg, parent_tg, rw);
 	} else {
 		throtl_qnode_add_bio(bio, &tg->qnode_on_parent[rw],
 				     &parent_sq->queued[rw]);
+		printk("cgroup: transfer bio to td->queue ");
 		BUG_ON(tg->td->nr_queued[rw] <= 0);
 		tg->td->nr_queued[rw]--;
 	}
@@ -1171,12 +1178,17 @@ static void blk_throtl_dispatch_work_fn(struct work_struct *work)
 
 	if (!bio_list_empty(&bio_list_on_stack)) {
 		blk_start_plug(&plug);
-		while ((bio = bio_list_pop(&bio_list_on_stack)))
+		while ((bio = bio_list_pop(&bio_list_on_stack))) {
+			printk("cgroup: submit one bio after throtl 限流后fn提交");
 			submit_bio_noacct(bio);
+		}
 		blk_finish_plug(&plug);
 	}
 }
-
+// static void wyz_tag_bio(struct bio *bio)
+// {
+// 	bio->wyz_throtl_tag=1;
+// }
 // static void wyz_blk_throtl_dispatch_work_fn(struct work_struct *work)
 // {
 // 	/* 这个地方td没改，可以改成tg里面自己的一个work_struct */
@@ -1198,23 +1210,22 @@ static void blk_throtl_dispatch_work_fn(struct work_struct *work)
 // 	bio_list_init(&bio_list_on_stack);
 
 // 	// spin_lock_irq(&q->queue_lock);
-// 	// for (rw = READ; rw <= WRITE; rw++)
-// 	// 	while ((bio = throtl_pop_queued(&td_sq->queued[rw], NULL)))
-// 	// 		bio_list_add(&bio_list_on_stack, bio);
-// 	// spin_unlock_irq(&q->queue_lock);
-
-// 	// spin_lock_irq(&q->queue_lock);
 // 	for (rw = READ; rw <= WRITE; rw++)
-// 		while ((bio = throtl_pop_queued(&tg->wyz_queued[rw], NULL)))
+// 		while ((bio = throtl_pop_queued(&tg->wyz_queued[rw], NULL))) {
 // 			bio_list_add(&bio_list_on_stack, bio);
+// 			printk("fn_throtlqnode_poll");
+// 		}
 // 	// spin_unlock_irq(&q->queue_lock);
 
 // 	printk("read wyz_queued wyz_blk_throtl_dispatch_work_fn!");
 
 // 	if (!bio_list_empty(&bio_list_on_stack)) {
 // 		blk_start_plug(&plug);
-// 		while ((bio = bio_list_pop(&bio_list_on_stack)))
+// 		while ((bio = bio_list_pop(&bio_list_on_stack))) {
+// 			// wyz_tag_bio(bio);
 // 			submit_bio_noacct(bio);
+// 			printk("fn_submit");
+// 		}
 // 		blk_finish_plug(&plug);
 // 	}
 // 	printk("finish wyz_blk_throtl_dispatch_work_fn!");
@@ -2091,7 +2102,7 @@ bool blk_throtl_bio(struct bio *bio)
 	// printk("before bpf enabled");
 	if (bpf_sched_enabled()) {
 		int ret;
-		printk("after bpf enabled and func");
+		// printk("after bpf enabled and func");
 		ret = bpf_sched_blk_check_throttle(bio, tg);
 		if (ret == 1)
 			goto jmprules;
@@ -2112,15 +2123,84 @@ bool blk_throtl_bio(struct bio *bio)
 
 			/* 多个bio_list(qnode链表)+自己的数据结构 */
 			// wyz_throtl_add_bio_tg(bio, &tg->wyz_qnode_on_self[rw],tg);
-			throttled = true;
+			/* 不阻塞了，只看看链表的效果 */
+			// throttled = true;
+
+			/* 真链表 */
+			struct wyz_bio_list_node *bio_list_node;
+			bio_list_node =
+				kmalloc(sizeof(*bio_list_node), GFP_KERNEL);
+			if (!bio_list_node) {
+				printk("ebpf: kmalloc error");
+				goto out;
+			}
+			printk("ebpf: after kmalloc");
+
+			bio_list_node->bio = bio;
+			INIT_LIST_HEAD(&bio_list_node->node);
+			printk("ebpf: init head");
+
+			if (!&bio_list_node->node) {
+				printk("ebpf: node is NULL");
+				goto out;
+			}
+			if (!&(bio_list_node->node.next) ||
+			    !&(bio_list_node->node.prev)) {
+				printk("ebpf: queued member is NULL");
+				goto out;
+			}
+			if (!&tg->wyz_queued[rw]) {
+				printk("ebpf: queued is NULL");
+				goto out;
+			}
+			if (!&(tg->wyz_queued[rw].next) ||
+			    !&(tg->wyz_queued[rw].prev)) {
+				printk("ebpf: queued member is NULL");
+				goto out;
+			}
+			if (!(tg->wyz_queued[rw].next) ||
+			    !(tg->wyz_queued[rw].prev)) {
+				INIT_LIST_HEAD(&tg->wyz_queued[rw]);
+				printk("ebpf: 初始化这个throtl_grp的queued");
+			}
+			// printk("ebpf: wyz_bio_list_node*:%p", bio_list_node);
+			// printk("ebpf: bio*:%p", bio);
+			// printk("ebpf: 新建链表节点中list_head地址:%p",
+			//        &bio_list_node->node);
+			// printk("ebpf: list_head里prev成员地址:%p",
+			//        &(bio_list_node->node.prev));
+			// printk("ebpf: list_head里next成员地址:%p",
+			//        &(bio_list_node->node.next));
+			// printk("ebpf: list_head里prev指针值:%p",
+			//        bio_list_node->node.prev);
+			// printk("ebpf: list_head里next指针值:%p",
+			//        bio_list_node->node.next);
+			// printk("ebpf: 头节点queued地址:%p",
+			//        &tg->wyz_queued[rw]);
+			// printk("ebpf: 头节点queued的prev成员地址:%p",
+			//        &(tg->wyz_queued[rw].prev));
+			// printk("ebpf: 头节点queued的next成员地址:%p",
+			//        &(tg->wyz_queued[rw].next));
+			printk("初始化了 %p 这个throtl_grp里面的queued  3", tg);
+			printk("ebpf: 头节点queued的prev指针值:%p",
+			       tg->wyz_queued[rw].prev);
+			printk("ebpf: 头节点queued的next指针值:%p",
+			       tg->wyz_queued[rw].next);
+
+			printk("ebpf: before add bio to list");
+			list_add_tail(&bio_list_node->node,
+				      &tg->wyz_queued[rw]);
+			printk("ebpf: add bio to list");
 			// spin_unlock_irq(&q->queue_lock);
-			goto out;
+			return false;
 		}
 		if (ret == 4) {
 			// INIT_WORK(&tg->wyz_dispatch_work,
 			// 	  wyz_blk_throtl_dispatch_work_fn);
-			// INIT_LIST_HEAD(&tg->wyz_queued[0]);
-			// INIT_LIST_HEAD(&tg->wyz_queued[1]);
+			INIT_LIST_HEAD(&tg->wyz_queued[0]);
+			INIT_LIST_HEAD(&tg->wyz_queued[1]);
+			printk("初始化了 %p 这个throtl_grp里面的queued  4", tg);
+			throtl_qnode_init(&tg->wyz_qnode_on_self[rw], tg);
 		}
 		if (ret == 5) {
 			/* dispatch worker */

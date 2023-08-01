@@ -63,6 +63,11 @@ struct throtl_qnode {
 	struct throtl_grp *tg; /* tg this qnode belongs to */
 };
 
+struct wyz_bio_list_node {
+	struct list_head node;
+	struct bio *bio;
+};
+
 struct throtl_service_queue {
 	struct throtl_service_queue *parent_sq; /* the parent service_queue */
 
@@ -176,8 +181,9 @@ struct throtl_grp {
 	struct blkg_rwstat stat_bytes;
 	struct blkg_rwstat stat_ios;
 
-	// struct list_head wyz_queued[2];
-	// struct throtl_qnode wyz_qnode_on_self[2];
+	struct list_head wyz_queued[2];
+	struct throtl_qnode wyz_qnode_on_self[2];
+	struct wyz_bio_list_node wyz_node[2];
 	// struct work_struct wyz_dispatch_work;
 };
 

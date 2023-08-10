@@ -184,7 +184,7 @@ struct throtl_grp {
 	struct list_head wyz_queued[2];
 	struct throtl_qnode wyz_qnode_on_self[2];
 	struct wyz_bio_list_node wyz_node[2];
-	// struct work_struct wyz_dispatch_work;
+	struct work_struct wyz_dispatch_work;
 };
 
 #define IO_SCHED
